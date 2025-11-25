@@ -17,7 +17,7 @@ from utils import synthesize_all
 from presidio_flask_estbert import (
     load_presidio_from_config,
     validate_config,
-    analyze_with_lists
+    analyze_batch_with_lists
 )
 
 # Configure logging
@@ -564,47 +564,48 @@ Endpoint tagastab `results` massiivi, kus iga element vastab ühele sisendteksti
                     # Anonymize the text
                     results_array = []
 
-                    for idx, text in enumerate(texts):
-                        logger.info(f"Processing text {idx + 1}/{len(texts)}")
-
-                        # Analyze text with allowlist/denylist support
-                        analyzer_results = analyze_with_lists(
-                            analyzer=server_instance.analyzer,
-                            text=text,
-                            entities=entities_to_detect,
-                            language=language,
-                            allowlist=allowlist if allowlist else None,
-                            denylist=denylist if denylist else None,
-                        )
-
+                    batch_analyzer_results = analyze_batch_with_lists(
+                        analyzer=server_instance.analyzer,
+                        texts=texts,
+                        entities=entities_to_detect,
+                        language=language,
+                        allowlist=allowlist if allowlist else None,
+                        denylist=denylist if denylist else None
+                    )
+                    
+                    # Anonymize each text (this part is still sequential, but analysis is batched)
+                    results_array = []
+                    for idx, (text, analyzer_results) in enumerate(zip(texts, batch_analyzer_results)):
+                        logger.debug(f"Anonymizing text {idx + 1}/{len(texts)}")
+                        
                         # Anonymize the text
                         anonymized_result = server_instance.anonymizer.anonymize(
                             text=text,
                             analyzer_results=analyzer_results,
-                            operators=operators,
+                            operators=operators
                         )
-
+                        
                         # Convert items to JSON format
                         items_json = []
                         for item in anonymized_result.items:
-                            items_json.append(
-                                {
-                                    "start": item.start,
-                                    "end": item.end,
-                                    "entity_type": item.entity_type,
-                                    "text": item.text,
-                                    "operator": item.operator,
-                                }
-                            )
-
-                        # Add this text's result to the array
-                        results_array.append(
-                            {"text": anonymized_result.text, "items": items_json}
-                        )
-
-                    logger.info(f"Successfully processed {len(results_array)} texts")
-
-                    return {"results": results_array}, 200
+                            items_json.append({
+                                "start": item.start,
+                                "end": item.end,
+                                "entity_type": item.entity_type,
+                                "text": item.text,
+                                "operator": item.operator
+                            })
+                        
+                        results_array.append({
+                            "text": anonymized_result.text,
+                            "items": items_json
+                        })
+                    
+                    logger.info(f"Successfully processed {len(results_array)} texts (batch optimized)")
+                    
+                    return {
+                        "results": results_array
+                    }, 200
 
                     
                 except Exception as e:

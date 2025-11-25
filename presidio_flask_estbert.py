@@ -78,6 +78,49 @@ class EstBERTRecognizer(EntityRecognizer):
             logger.error(f"Error in EstBERT analysis: {e}")
             
         return results
+    
+    
+    def analyze_batch(self, texts: List[str], entities: List[str]) -> List[List[RecognizerResult]]:
+        """Analyze multiple texts in a single batch (optimized)"""
+        all_results = []
+        
+        if not texts:
+            return all_results
+        
+        try:
+            # Batch inference - much faster than sequential
+            logger.info(f"Running batch inference on {len(texts)} texts")
+            batch_ner_results = self.nlp_pipeline(texts)
+            
+            # Process results for each text
+            for _, ner_results in enumerate(batch_ner_results):
+                text_results = []
+                
+                for entity in ner_results:
+                    entity_type = entity.get('entity_group', entity.get('entity', '')).replace('B-', '').replace('I-', '')
+                    presidio_entity = self.label_mapping.get(entity_type, entity_type)
+                    
+                    if presidio_entity in entities:
+                        result = RecognizerResult(
+                            entity_type=presidio_entity,
+                            start=entity['start'],
+                            end=entity['end'],
+                            score=entity['score']
+                        )
+                        text_results.append(result)
+                
+                all_results.append(text_results)
+            
+            logger.info(f"Batch inference completed: found entities in {len([r for r in all_results if r])} texts")
+                    
+        except Exception as e:
+            logger.error(f"Error in batch EstBERT analysis: {e}")
+            # Fallback to sequential processing
+            logger.warning("Falling back to sequential processing")
+            for text in texts:
+                all_results.append(self.analyze(text, entities))
+            
+        return all_results
 
 
 class DenylistRecognizer(EntityRecognizer):
@@ -275,74 +318,6 @@ def load_presidio_from_config(config_path: str):
     return analyzer
 
 
-def analyze_with_lists(
-    analyzer: AnalyzerEngine,
-    text: str,
-    entities: List[str],
-    language: str = "xx",
-    allowlist: Optional[List[str]] = None,
-    denylist: Optional[List[str]] = None,
-    return_decision_process: bool = False,
-    correlation_id: Optional[str] = None
-) -> List[RecognizerResult]:
-    """Analyze text with allowlist and denylist support"""
-    
-    logger.info(f"analyze_with_lists:")
-    logger.info(f"  Text length: {len(text)}")
-    logger.info(f"  Language: {language}")
-    logger.info(f"  Entities: {entities}")
-    
-    # Check recognizers BEFORE analysis
-    try:
-        recognizers = analyzer.get_recognizers(language)
-        logger.info(f"  Available recognizers: {len(recognizers)}")
-        
-        if len(recognizers) == 0:
-            error_msg = f"No recognizers registered for language '{language}'. This is a configuration error."
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-            
-    except Exception as e:
-        logger.error(f"  Failed to get recognizers: {e}")
-        raise
-    
-    # Run analysis
-    try:
-        results = analyzer.analyze(
-            text=text,
-            entities=entities,
-            language=language,
-            return_decision_process=return_decision_process,
-            correlation_id=correlation_id
-        )
-        logger.info(f"  Found {len(results)} entities")
-    except Exception as e:
-        logger.error(f"  Analysis failed: {e}", exc_info=True)
-        raise
-    
-    # Apply allowlist
-    if allowlist:
-        original_count = len(results)
-        results = apply_allowlist(results, text, allowlist)
-        logger.info(f"  After allowlist: {len(results)} entities")
-    
-    # Add denylist
-    if denylist:
-        denylist_recognizer = DenylistRecognizer(
-            denylist=denylist,
-            entity_type="DENYLIST_MATCH",
-            supported_language=language
-        )
-        denylist_results = denylist_recognizer.analyze(text, ["DENYLIST_MATCH"])
-        logger.info(f"  Denylist found: {len(denylist_results)} entities")
-        results.extend(denylist_results)
-    
-    results.sort(key=lambda x: x.start)
-    logger.info(f"  Final: {len(results)} entities")
-    
-    return results
-
-
 def validate_config(config_path: str) -> tuple:
     """Validate Presidio configuration file"""
     try:
@@ -359,3 +334,102 @@ def validate_config(config_path: str) -> tuple:
         
     except Exception as e:
         return False, f"Configuration error: {str(e)}"
+    
+    
+def analyze_batch_with_lists(
+    analyzer: AnalyzerEngine,
+    texts: List[str],
+    entities: List[str],
+    language: str = "xx",
+    allowlist: Optional[List[str]] = None,
+    denylist: Optional[List[str]] = None
+) -> List[List[RecognizerResult]]:
+    """
+    Analyze multiple texts with batch processing through EstBERT (optimized).
+    
+    This function uses batch inference for EstBERT, which is much faster than
+    processing texts sequentially.
+    """
+
+    try:
+        recognizers = analyzer.get_recognizers(language)
+        logger.info(f"  Available recognizers: {len(recognizers)}")
+        
+        if len(recognizers) == 0:
+            error_msg = f"No recognizers registered for language '{language}'."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Find EstBERT recognizer for batch processing
+        estbert_recognizer = None
+        pattern_recognizers = []
+        
+        for recognizer in recognizers:
+            if recognizer.name == "EstBERT_NER_Recognizer":
+                estbert_recognizer = recognizer
+            else:
+                pattern_recognizers.append(recognizer)
+        
+        logger.info(f"  EstBERT recognizer: {'Found' if estbert_recognizer else 'Not found'}")
+        logger.info(f"  Pattern recognizers: {len(pattern_recognizers)}")
+            
+    except Exception as e:
+        logger.error(f"  Failed to get recognizers: {e}")
+        raise
+    
+    all_results = []
+    
+    # 1. Batch process through EstBERT (if available)
+    estbert_results = []
+    if estbert_recognizer and hasattr(estbert_recognizer, 'analyze_batch'):
+        try:
+            logger.info("  Running batch EstBERT inference...")
+            estbert_results = estbert_recognizer.analyze_batch(texts, entities)
+        except Exception as e:
+            logger.error(f"  Batch EstBERT failed, falling back to sequential: {e}")
+            # Fallback to sequential
+            for text in texts:
+                estbert_results.append(estbert_recognizer.analyze(text, entities))
+    else:
+        # No batch support, process sequentially
+        logger.info("  No batch support, processing EstBERT sequentially")
+        if estbert_recognizer:
+            for text in texts:
+                estbert_results.append(estbert_recognizer.analyze(text, entities))
+        else:
+            estbert_results = [[] for _ in texts]
+    
+    # 2. Process each text with pattern recognizers and filters
+    for idx, text in enumerate(texts):
+        # Start with EstBERT results for this text
+        results = estbert_results[idx] if idx < len(estbert_results) else []
+        
+        # Add pattern recognizer results
+        for recognizer in pattern_recognizers:
+            try:
+                pattern_results = recognizer.analyze(text, entities)
+                results.extend(pattern_results)
+            except Exception as e:
+                logger.error(f"  Pattern recognizer {recognizer.name} failed on text {idx}: {e}")
+        
+        # Apply allowlist
+        if allowlist:
+            results = apply_allowlist(results, text, allowlist)
+        
+        # Add denylist
+        if denylist:
+            denylist_recognizer = DenylistRecognizer(
+                denylist=denylist,
+                entity_type="DENYLIST_MATCH",
+                supported_language=language
+            )
+            denylist_results = denylist_recognizer.analyze(text, ["DENYLIST_MATCH"])
+            results.extend(denylist_results)
+        
+        # Sort and add to results
+        results.sort(key=lambda x: x.start)
+        all_results.append(results)
+    
+    logger.info(f"  Batch processing complete: {len(all_results)} texts processed")
+    
+    return all_results
